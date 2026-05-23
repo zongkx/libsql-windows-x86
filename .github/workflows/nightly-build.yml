@@ -1,12 +1,11 @@
-name: Nightly libsql Windows ARM64 Build
+name: Nightly libsql Windows x64 Build
 
-# Builds Turso's libsql-js for aarch64-pc-windows-msvc and publishes a
-# per-version `@libsql/win32-arm64-msvc` Release (the platform package Turso
-# does not publish). Consumed by khairm/superset-windows-arm64.
+# Builds Turso's libsql-js for x86_64-pc-windows-msvc and publishes a
+# per-version `@libsql/win32-x64-msvc` Release.
 #
 # Change-gated: the nightly only builds when the libsql version it would build
 # is not already released here. workflow_dispatch can build a specific version
-# on demand (e.g. when superset resolves a libsql version not yet built).
+# on demand.
 #
 # Deterministic: no source patch is required (we compile upstream libsql-js
 # unmodified and bypass `neon dist` — the built cdylib IS the Node addon once
@@ -19,7 +18,7 @@ on:
         description: libsql version to build (blank = latest on npm)
         default: ""
   schedule:
-    - cron: "30 0 * * *" # 00:30 UTC daily (after upstream/superset cadence)
+    - cron: "30 0 * * *" # 00:30 UTC daily
 
 permissions:
   contents: write
@@ -56,7 +55,7 @@ jobs:
   build:
     needs: check
     if: needs.check.outputs.should_build == 'true'
-    runs-on: windows-11-arm
+    runs-on: windows-latest
     steps:
       - name: Checkout patches repo
         uses: actions/checkout@v5
@@ -65,15 +64,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          architecture: "x64" # 确保 Node.js 是标准 64 位
 
-      - name: Ensure Rust (rust-toolchain.toml pins the toolchain)
+      - name: Ensure Rust x64 Target
         shell: pwsh
         run: |
-          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
-            Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
-            ./rustup-init.exe -y --default-toolchain none --profile minimal
-            Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
-          }
+          # windows-latest 默认自带了 x86_64-pc-windows-msvc，这里做一次显式确保
+          rustup target add x86_64-pc-windows-msvc
 
       - name: Clone libsql-js @ version
         shell: bash
@@ -87,7 +84,6 @@ jobs:
         shell: bash
         run: |
           rustup show
-          rustup target add aarch64-pc-windows-msvc || true
           rustc -vV
 
       - name: Locate libclang (libSQL bindgen)
@@ -98,27 +94,25 @@ jobs:
           if ($c) { Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$($c.DirectoryName)"; Write-Host "LIBCLANG_PATH=$($c.DirectoryName)" }
           else { Write-Host "::warning::libclang.dll not found; bindgen may fail" }
 
-      - name: Cargo build (release, aarch64-pc-windows-msvc)
+      - name: Cargo build (release, x86_64-pc-windows-msvc)
         working-directory: libsql-js
         shell: bash
         env:
           CARGO_TERM_COLOR: always
         run: |
           set -eo pipefail
-          # Neon cdylib: the produced DLL IS the Node addon once renamed .node.
-          # Bypass the neon-rs 0.0.x CLI entirely (it rejects --target / breaks
-          # the Windows cargo|neon pipe).
-          cargo build --release --target aarch64-pc-windows-msvc 2> ../cargo-stderr.log \
+          # 编译目标换成 64 位 Windows MSVC 工具链
+          cargo build --release --target x86_64-pc-windows-msvc 2> ../cargo-stderr.log \
             || { echo "CARGO FAILED:"; tail -100 ../cargo-stderr.log; exit 1; }
-          ls -la "target/aarch64-pc-windows-msvc/release"/*.dll || true
+          ls -la "target/x86_64-pc-windows-msvc/release"/*.dll || true
 
-      - name: Package + verify @libsql/win32-arm64-msvc
+      - name: Package + verify @libsql/win32-x64-msvc
         working-directory: libsql-js
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $V = "${{ needs.check.outputs.version }}"
-          $rel = 'target\aarch64-pc-windows-msvc\release'
+          $rel = 'target\x86_64-pc-windows-msvc\release'
           $dll = Join-Path $rel 'libsql_js.dll'
           if (-not (Test-Path $dll)) {
             $cand = Get-ChildItem "$rel\*.dll" -ErrorAction SilentlyContinue |
@@ -127,21 +121,25 @@ jobs:
             if (-not $cand) { Write-Error "no cdylib .dll in $rel"; exit 1 }
             $dll = $cand.FullName
           }
+          
+          # 读取 PE 头验证是否为标准 64 位 AMD64/x86_64 (IMAGE_FILE_MACHINE_AMD64 = 0x8664)
           $fs=[IO.File]::OpenRead($dll);$br=New-Object IO.BinaryReader($fs);$fs.Position=0x3C;$pe=$br.ReadInt32();$fs.Position=$pe+4;$m=$br.ReadUInt16();$br.Close()
-          if ($m -ne 0xAA64) { Write-Error "cdylib not ARM64 (0x$('{0:X}' -f $m))"; exit 1 }
+          if ($m -ne 0x8664) { Write-Error "cdylib not Windows x64 (0x$('{0:X}' -f $m))"; exit 1 }
+          
           $stage = "$env:GITHUB_WORKSPACE\stage"
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item $dll "$stage\index.node" -Force
           @"
           {
-            "name": "@libsql/win32-arm64-msvc",
+            "name": "@libsql/win32-x64-msvc",
             "version": "$V",
             "os": ["win32"],
-            "cpu": ["arm64"],
+            "cpu": ["x64"],
             "main": "index.node"
           }
           "@ | Set-Content "$stage\package.json"
-          # Definitive proof it is a loadable ARM64 Node addon.
+          
+          # 冒烟测试：确保 64 位 Node 可以正常加载它
           node -e "require(process.argv[1]); console.log('ADDON LOADED OK')" "$stage\index.node"
           if ($LASTEXITCODE -ne 0) { Write-Error "index.node failed to load"; exit 1 }
           Get-ChildItem $stage
@@ -150,9 +148,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tar -czf libsql-win32-arm64-msvc.tar.gz -C stage .
-          sha256sum libsql-win32-arm64-msvc.tar.gz > libsql-win32-arm64-msvc.tar.gz.sha256
-          cat libsql-win32-arm64-msvc.tar.gz.sha256
+          tar -czf libsql-win32-x64-msvc.tar.gz -C stage .
+          sha256sum libsql-win32-x64-msvc.tar.gz > libsql-win32-x64-msvc.tar.gz.sha256
+          cat libsql-win32-x64-msvc.tar.gz.sha256
 
       - name: Publish per-version Release
         env:
@@ -164,16 +162,14 @@ jobs:
           gh release delete "$V" --repo "${{ github.repository }}" --yes 2>/dev/null || true
           git push --delete origin "refs/tags/$V" 2>/dev/null || true
           gh release create "$V" \
-            libsql-win32-arm64-msvc.tar.gz \
-            libsql-win32-arm64-msvc.tar.gz.sha256 \
+            libsql-win32-x64-msvc.tar.gz \
+            libsql-win32-x64-msvc.tar.gz.sha256 \
             --repo "${{ github.repository }}" \
-            --title "libsql $V — @libsql/win32-arm64-msvc" \
-            --notes "Native Windows ARM64 build of [tursodatabase/libsql-js](https://github.com/tursodatabase/libsql-js) \`v$V\` (the \`@libsql/win32-arm64-msvc\` platform package Turso does not publish).
+            --title "libsql $V — @libsql/win32-x64-msvc" \
+            --notes "Native Windows x64 (64-bit) build of [tursodatabase/libsql-js](https://github.com/tursodatabase/libsql-js) \`v$V\` (the \`@libsql/win32-x64-msvc\` platform package).
 
-          Tag = the libsql version. Consumed by [superset-windows-arm64](https://github.com/khairm/superset-windows-arm64).
+          Tag = the libsql version.
 
           **Assets:**
-          - \`libsql-win32-arm64-msvc.tar.gz\` — extract to get \`index.node\` + \`package.json\` (drop in as \`@libsql/win32-arm64-msvc\`)
-          - \`libsql-win32-arm64-msvc.tar.gz.sha256\`
-
-          Built deterministically (no upstream source patch). Not affiliated with Turso."
+          - \`libsql-win32-x64-msvc.tar.gz\` — extract to get \`index.node\` + \`package.json\` (drop in as \`@libsql/win32-x64-msvc\`)
+          - \`libsql-win32-x64-msvc.tar.gz.sha256\`"
